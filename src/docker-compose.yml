@@ -1,0 +1,119 @@
+version: "3.9"
+
+services:
+
+  leader:
+    build: .
+    container_name: kv-leader
+    environment:
+      ROLE: "leader"
+      FOLLOWERS: "http://f1:8000,http://f2:8000,http://f3:8000,http://f4:8000,http://f5:8000"
+      WRITE_QUORUM: "${WRITE_QUORUM:-3}"
+      MIN_DELAY_MS: "0"
+      MAX_DELAY_MS: "1000"
+      REPLICATION_TIMEOUT_S: "2.0"
+      GLOBAL_REQUEST_TIMEOUT_S: "5.0"
+    ports:
+      - "8080:8000"
+
+    # High priority + isolated CPU
+    deploy:
+      resources:
+        reservations:
+          cpus: '1.0'
+          memory: 256m
+    cpuset: "0"       # Leader uses CPU core 0
+    cpu_shares: 2048  # Leader has higher CPU scheduling priority
+
+    depends_on:
+      - f1
+      - f2
+      - f3
+      - f4
+      - f5
+
+
+  f1:
+    build: .
+    container_name: kv-f1
+    environment:
+      ROLE: "follower"
+    ports:
+      - "8081:8000"
+
+    # Followers get lower priority and separate core
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 128m
+    cpuset: "1"
+    cpu_shares: 512
+
+
+  f2:
+    build: .
+    container_name: kv-f2
+    environment:
+      ROLE: "follower"
+    ports:
+      - "8082:8000"
+
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 128m
+    cpuset: "1"
+    cpu_shares: 512
+
+
+  f3:
+    build: .
+    container_name: kv-f3
+    environment:
+      ROLE: "follower"
+    ports:
+      - "8083:8000"
+
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 128m
+    cpuset: "1"
+    cpu_shares: 512
+
+
+  f4:
+    build: .
+    container_name: kv-f4
+    environment:
+      ROLE: "follower"
+    ports:
+      - "8084:8000"
+
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 128m
+    cpuset: "1"
+    cpu_shares: 512
+
+
+  f5:
+    build: .
+    container_name: kv-f5
+    environment:
+      ROLE: "follower"
+    ports:
+      - "8085:8000"
+
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.5'
+          memory: 128m
+    cpuset: "1"
+    cpu_shares: 512
