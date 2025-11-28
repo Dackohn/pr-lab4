@@ -15,23 +15,16 @@ services:
       GLOBAL_REQUEST_TIMEOUT_S: "5.0"
     ports:
       - "8080:8000"
-
-    # High priority + isolated CPU
-    deploy:
-      resources:
-        reservations:
-          cpus: '1.0'
-          memory: 256m
-    cpuset: "0"       # Leader uses CPU core 0
-    cpu_shares: 2048  # Leader has higher CPU scheduling priority
-
+    volumes:
+      - ./data/leader:/data
+    cpuset: "0"
+    cpu_shares: 2048
     depends_on:
       - f1
       - f2
       - f3
       - f4
       - f5
-
 
   f1:
     build: .
@@ -40,16 +33,10 @@ services:
       ROLE: "follower"
     ports:
       - "8081:8000"
-
-    # Followers get lower priority and separate core
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 128m
+    volumes:
+      - ./data/f1:/data
     cpuset: "1"
     cpu_shares: 512
-
 
   f2:
     build: .
@@ -58,15 +45,10 @@ services:
       ROLE: "follower"
     ports:
       - "8082:8000"
-
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 128m
+    volumes:
+      - ./data/f2:/data
     cpuset: "1"
     cpu_shares: 512
-
 
   f3:
     build: .
@@ -75,15 +57,10 @@ services:
       ROLE: "follower"
     ports:
       - "8083:8000"
-
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 128m
+    volumes:
+      - ./data/f3:/data
     cpuset: "1"
     cpu_shares: 512
-
 
   f4:
     build: .
@@ -92,15 +69,10 @@ services:
       ROLE: "follower"
     ports:
       - "8084:8000"
-
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 128m
+    volumes:
+      - ./data/f4:/data
     cpuset: "1"
     cpu_shares: 512
-
 
   f5:
     build: .
@@ -109,11 +81,7 @@ services:
       ROLE: "follower"
     ports:
       - "8085:8000"
-
-    deploy:
-      resources:
-        reservations:
-          cpus: '0.5'
-          memory: 128m
+    volumes:
+      - ./data/f5:/data
     cpuset: "1"
     cpu_shares: 512

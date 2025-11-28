@@ -1,26 +1,26 @@
-# **Leader-Follower**
 
-### *Performance Analysis & Quorum-Based Latency Study*
 
----
+# **Leader - Follower**
+
+
 
 ## **1. Introduction**
 
-This project implements a distributed **key–value store** following the **Single-Leader Replication** model described in Martin Kleppmann’s *Designing Data-Intensive Applications* (DDIA), Chapter 5 (“Leaders and Followers”).
+The goal of this laboratory work is to implement a **distributed key-value store** using the **Single-Leader Replication** model described in *Designing Data-Intensive Applications* by Martin Kleppmann (Chapter 5, Section 1: *“Leaders and Followers”*).
 
-A single **leader node** accepts all client writes and replicates them to **five follower nodes** using **semi-synchronous replication**:
+The implementation consists of:
 
-* The leader broadcasts each write to all followers concurrently.
-* The leader waits for a **configurable quorum** (1–5 ACKs) before responding.
-* Each follower applies the update immediately.
-* Artificial network delay is added `[0ms – 1000ms]` to simulate a real-world distributed environment.
+* One **leader** replica that accepts write requests.
+* Five **follower** replicas that apply updates received from the leader.
+* All nodes run concurrently in separate Docker containers using **docker-compose**.
+* The replication process uses **semi-synchronous replication**, where:
 
-The system runs in **Docker Compose**, each node in its own container, communicating over **HTTP + JSON** using FastAPI.
+  * The leader returns success to the client **after a configurable number of followers acknowledge** the write.
+  * This number is called the **write quorum (W)** and is set through environment variables.
 
-We conduct an experiment performing **100 concurrent writes** (10 at a time) to measure:
+To emulate real-world distributed systems, the leader introduces a **random network delay** between `[MIN_DELAY, MAX_DELAY]` before sending replication requests to followers.
 
-1. **Write latency** vs **quorum size**
-2. **Consistency** between leader and followers after all writes
+The experiment evaluates system performance for **five quorum values** (1–5) and inspects if the followers remain consistent with the leader after the entire workload.
 
 ---
 
@@ -28,178 +28,270 @@ We conduct an experiment performing **100 concurrent writes** (10 at a time) to 
 
 ### **2.1 Components**
 
-* **Leader node**
+#### **Leader Node**
 
-  * Accepts writes (`PUT /kv/{key}`)
-  * Applies them locally
-  * Sends replication RPCs concurrently to all followers
-  * Waits for *quorum* acknowledgements before returning success
+* Accepts all HTTP `PUT /kv/{key}` write operations.
+* Immediately applies the update locally.
+* Sends **replicate RPCs** to all followers concurrently.
+* Waits for **W successful acknowledgments** before returning success to the client.
+* Uses random delay per follower to simulate network jitter.
 
-* **Follower nodes**
+#### **Follower Nodes**
 
-  * Accept replication RPCs (`POST /replicate/{key}`)
-  * Apply the write to local memory
+* Only accept replication RPCs: `POST /replicate/{key}`.
+* Apply values to local memory immediately.
+* Do not accept direct client writes.
 
-* **Client (experiment script)**
+#### **Client / Performance Script**
 
-  * Issues batched write operations
-  * Measures latency
-  * Collects percentile statistics (mean, median, p95, p99)
-  * Validates state consistency
+* Issues 100 total writes, with 10 writes happening concurrently.
+* Rotates between 10 distinct keys (`k0`–`k9`).
+* Measures latency of each write request.
+* Collects mean, median, p95, p99 for each quorum.
+* Saves leader + follower databases for offline inspection.
+* Generates a latency plot for all quorum values.
+
+### **2.2 API Endpoints**
+
+| Endpoint                | Node               | Description                  |
+| ----------------------- | ------------------ | ---------------------------- |
+| `GET /health`           | Leader & Followers | Health check                 |
+| `GET /kv/{key}`         | Leader             | Read current value           |
+| `PUT /kv/{key}`         | Leader             | Write + replicate            |
+| `POST /replicate/{key}` | Follower           | Apply replication update     |
+| `GET /debug/store`      | All                | Debug view of internal store |
+
+### **2.3 Configuration via Environment Variables**
+
+All nodes are configured through Docker environment variables:
+
+* `ROLE=leader|follower`
+* `FOLLOWERS=http://f1:8000,...`
+* `WRITE_QUORUM=1..5`
+* `MIN_DELAY_MS`
+* `MAX_DELAY_MS`
+* `REPLICATION_TIMEOUT_S`
+* `GLOBAL_REQUEST_TIMEOUT_S`
 
 ---
 
-## **3. Quorum and Semi-Synchronous Replication**
+## **3. Replication Model**
 
-A **quorum** is the **minimum number of follower acknowledgments** the leader must receive before confirming a write.
+### **3.1 Single-Leader Replication**
 
-Let:
+Only the leader receives writes. All followers passively apply updates sent from the leader. This matches the model described in DDIA: a centralized sequence of writes is maintained through replication.
 
-* **N = 5 followers**
-* **W = write quorum**
+### **3.2 Semi-Synchronous Replication**
 
-| W (quorum) | Meaning                                               |
-| ---------- | ----------------------------------------------------- |
-| **1**      | Fastest, least durable (only 1 follower must respond) |
-| **3**      | Balanced durability & performance                     |
-| **5**      | Most durable, slowest (all followers must ACK)        |
+When the leader receives a write:
 
-This mechanism models the trade-off between **latency** and **durability** in real-world distributed databases (Cassandra, Dynamo, Raft).
+1. It applies the value locally.
+2. It sends replication RPCs to all 5 followers **concurrently**.
+3. It waits for at least **W followers to send success**.
+4. Once W acknowledgments are received, the leader **returns success**, even if the remaining followers have not finished yet.
+
+This makes the system:
+
+* **Safer than asynchronous replication**, because a subset of followers must confirm the write.
+* **Faster than fully synchronous replication**, because not all followers need to confirm.
+
+### **3.3 Write Quorum Values Tested**
+
+We test:
+
+```
+W = 1, 2, 3, 4, 5
+```
+
+With:
+
+* 1 = minimal durability, lowest latency
+* 5 = full synchronization, highest latency
 
 ---
 
-## **4. Experimental Setup**
+## **4. Integration Test**
 
-### **4.1 Artificial Network Delay**
+An automated integration test suite verifies the system correctness:
 
-Each replication RPC includes a randomized delay:
+### ✔ Cluster becomes healthy
+
+### ✔ Leader accepts writes and responds correctly
+
+### ✔ Followers apply replication updates
+
+### ✔ Quorum logic behaves as expected (invalid quorum → write fails)
+
+### ✔ After multiple writes, follower state matches leader state
+
+These tests run against the real Docker deployment to ensure full-system correctness.
+
+---
+
+## **5. Performance Experiment Setup**
+
+### **5.1 Workload**
+
+* **100 total writes**
+* **10 concurrent writes at a time**
+* **10 rotating keys**
+* Leader performs:
+
+  * Local write
+  * Concurrent replication to all followers
+  * Waits for quorum acknowledgments
+
+### **5.2 Artificial Network Delay**
+
+The leader applies:
+
+```
+delay = random.uniform(MIN_DELAY_MS, MAX_DELAY_MS) / 1000
+```
+
+with:
 
 ```
 MIN_DELAY_MS = 0
 MAX_DELAY_MS = 1000
 ```
 
-Different followers experience different delays.
+This creates divergence in follower response times and simulates real network jitter and tail latency.
 
-### **4.2 Load Test**
+### **5.3 Measurements**
 
-* **100 total writes**
-* **10 concurrent writes**
-* **10 unique keys (k0 – k9)**
+For each quorum, we collect:
 
-### **4.3 Metrics Collected**
+* Mean latency
+* Median latency
+* p95 latency (95th percentile)
+* p99 latency (99th percentile)
+* Consistency snapshot of all DBs after test finishes
 
-For each quorum value (1 → 5):
-
-* **Mean latency**
-* **Median latency**
-* **p95 latency (95th percentile)**
-* **p99 latency (99th percentile)**
-
-### **4.4 Consistency Validation**
-
-After all writes:
-
-* Read `/debug/store` from leader
-* Compare with each follower's store
-
----
-
-## **5. Results**
-
-### **5.1 Latency Graph (mean, median, p95, p99)**
-
-> (Insert your generated plot here: **`quorum_vs_latency_full.png`**)
-> Example:
+A plot named:
 
 ```
-![Quorum vs Latency](quorum_vs_latency_full.png)
+quorum_vs_latency_full.png
 ```
 
----
-
-## **6. Interpretation of Results**
-
-### **6.1 Why does latency increase with quorum?**
-
-Increasing the quorum forces the leader to wait for **more followers**:
-
-* With **Q=1**, the leader returns as soon as **any follower** responds → fastest
-* With **Q=5**, the leader must wait for **the slowest follower** → slowest
-* The artificial random delay amplifies this effect
-
-**Expected outcome:**
-A monotonically increasing latency curve as quorum increases.
-
-### **6.2 Why do p95 and p99 spike?**
-
-Percentiles capture **tail latency**:
-
-* The slowest 1–5% of RPCs are affected by:
-
-  * Random 1-second delays
-  * Uvicorn event loop scheduling
-  * Docker container overhead
-  * Occasional timeouts or slowness
-
-This reflects real-world distributed systems, where the tail (p99) often dominates large-scale performance.
+is generated.
 
 ---
 
-## **7. Consistency Analysis**
+## **6. Results**
 
-### **Observed Behavior**
+### **6.1 Latency vs Quorum Plot**
 
-After all writes:
 
-* **Followers that acknowledged writes** have consistent data.
-* Followers that were **slow / timed out** may miss some writes.
-* This is expected with **semi-synchronous replication**:
+![Latency Plot](+MostCorrectVariant(Newest).png)
 
-  * The leader returns success once quorum is reached
-  * Followers outside the quorum may fall behind
 
-### **Implications**
+### **6.2 Interpretation of Performance Results**
 
-* **Q=1** risks high inconsistency
-* **Q=3** provides reasonable consistency
-* **Q=5** ensures all followers are fully consistent
+#### **Latency increases with quorum**
 
-This matches DDIA's discussion of consistency trade-offs.
+* With `W = 1`, the leader only waits for the fastest follower ⇒ lowest latency.
+* With `W = 5`, the leader must wait for **all** followers ⇒ slowest latency.
+* Intermediate values show smooth, increasing latency.
 
----
+This follows the principle discussed in DDIA:
 
-## **8. Discussion**
+> “A higher replication requirement increases durability but also increases latency, especially due to tail latency in distributed environments.”
 
-### **8.1 Why were latencies sometimes ~2 seconds despite random delay of only 0–1s?**
+#### **Tail latencies dominate**
 
-Because of:
+p95 and p99 show significantly higher values because:
 
-1. **Timeout effects** (`REPLICATION_TIMEOUT_S = 2.0s`)
-2. Leader waiting for slow tasks even after quorum
-3. Non-cancelled background tasks
+* Some follower delays approach 1000 ms
+* Python async scheduling & Docker overhead introduce jitter
+* Timeouts near 2 seconds impact slow followers
 
-Thus, the *timeout* became the dominant source of latency—not the artificial delay.
-
-### **8.2 Improving accuracy**
-
-To measure true delay behavior:
-
-* Reduce timeout
-* Cancel replication tasks once quorum is reached
-* Implement a clean k-minimum aggregator for replication responses
+This reflects real distributed system behavior: the slowest replica becomes the bottleneck at high quorum.
 
 ---
 
-## **9. Conclusion**
+## **7. Consistency Check**
 
-This experiment demonstrates:
+For each quorum, the final key-value databases of:
 
-* **Quorum size directly impacts write latency**
-* **Higher quorum → higher durability and consistency**
-* **Tail latency (p95/p99)** reveals slow follower behavior
-* **Semi-synchronous replication** is a trade-off between performance and safety
-* **Timeouts and slow tasks** can dominate system behavior in practice
+* leader
+* follower 1
+* follower 2
+* follower 3
+* follower 4
+* follower 5
 
-The results reflect the core principles of distributed replication from DDIA and provide a realistic understanding of quorum-based replication dynamics.
+are saved automatically.
 
+### **7.1 Observed Behavior**
+
+![ComparResult](quorum2res.png)
+
+For quorums that are smaller then 5 the data is inconsistent thorugh separate followers and the leader because of race condition.
+
+![ComparResult](quorum2.png)
+
+
+This is expected for semi-synchronous replication and is explicitly discussed in DDIA.For reference the leaders key values look like this at the end of the test with quorum 2.
+
+![ComparResult](quorum2lead.png)
+
+### **7.2 Explanation**
+
+When **quorum < N**, background tasks might:
+
+* time out
+* be delayed 
+* finish before the previous one ( **race condition** )
+
+Thus, consistency is **not guaranteed** unless:
+
+```
+WRITE_QUORUM == number_of_followers
+```
+
+This confirms the theory:
+
+> “Semi-synchronous replication does not guarantee full consistency unless all replicas are required to acknowledge.”
+
+---
+
+## **8. Conclusions**
+
+This laboratory verified the concepts explained in Chapter 5 of *Designing Data-Intensive Applications*:
+
+Single-leader replication implemented
+
+Semi-synchronous replication with configurable quorum
+
+Full concurrent replication using asyncio
+
+Network delay simulation
+
+Integration tests for correctness
+
+Performance analysis for W=1..5
+
+Consistency comparison between leader and followers
+
+### **Key Takeaways**
+
+* Increasing quorum increases write latency due to waiting for more follower acknowledgments.
+* Tail latency dominates at higher quorums because the slowest follower controls overall performance.
+* Full consistency (all followers = leader) is guaranteed only when quorum equals the total number of followers.
+* Lower quorums improve performance but reduce consistency guarantees.
+
+This system provides a realistic model of real-world distributed databases such as Cassandra, MongoDB (replica sets), and traditional master-slave architectures.
+
+---
+
+## **9. Appendix**
+
+### Files included:
+
+* `app.py` – complete leader/follower implementation
+* `docker-compose.yml` – deployment of leader + 5 followers
+* `perf_test.py` – load generation, latency measurement, snapshot saving, plotting
+* `test_integration.py` – integration tests
+* `quorum_vs_latency_full.png` – generated plot
+* `data/` – per-node stored databases per quorum

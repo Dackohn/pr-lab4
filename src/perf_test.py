@@ -1,9 +1,10 @@
-# perf_experiment.py
+# perf_test.py  (improved with DB snapshot saving)
 import asyncio
 import os
 import subprocess
 import sys
 import time
+import json
 from statistics import mean
 
 import httpx
@@ -19,18 +20,18 @@ FOLLOWERS = [
     "http://localhost:8085",
 ]
 
-QUORUM_VALUES = [1, 2, 3, 4, 5]  # test these write quorum values
+QUORUM_VALUES = [1, 2, 3, 4, 5]
 
 
-# ---------- Docker orchestration helpers ----------
-
+# -----------------------------------------
+# Docker helpers
+# -----------------------------------------
 def docker_compose_up(write_quorum: int):
     env = os.environ.copy()
     env["WRITE_QUORUM"] = str(write_quorum)
     print(f"\n=== Starting cluster with WRITE_QUORUM={write_quorum} ===")
     subprocess.run(["docker-compose", "down", "-v"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
     result = subprocess.run(
         ["docker-compose", "up", "-d", "--build"],
         env=env,
@@ -66,8 +67,9 @@ def wait_for_cluster_ready():
     print("Cluster is healthy.")
 
 
-# ---------- Load generation ----------
-
+# -----------------------------------------
+# Load generation
+# -----------------------------------------
 async def write_key(client: httpx.AsyncClient, key: str, value: str) -> float:
     start = time.perf_counter()
     r = await client.put(f"{LEADER}/kv/{key}", json={"value": value})
@@ -77,10 +79,6 @@ async def write_key(client: httpx.AsyncClient, key: str, value: str) -> float:
 
 
 async def run_load(num_writes=100, concurrent=10):
-    """
-    num_writes total writes, at most `concurrent` in flight.
-    keys: 10 distinct keys (0..9).
-    """
     latencies = []
     async with httpx.AsyncClient(timeout=10.0) as client:
         sem = asyncio.Semaphore(concurrent)
@@ -103,14 +101,29 @@ def fetch_store(url: str):
     return r.json()["store"]
 
 
-# ---------- Plotting (new full version) ----------
+# -----------------------------------------
+# NEW: Save DB snapshots per quorum
+# -----------------------------------------
+def save_snapshot(quorum: int, leader_store, follower_stores):
+    base = f"results/q{quorum}"
+    os.makedirs(base, exist_ok=True)
 
+    # save leader
+    with open(f"{base}/leader_store.json", "w") as f:
+        json.dump(leader_store, f, indent=2)
+
+    # save followers
+    for idx, fs in enumerate(follower_stores, start=1):
+        with open(f"{base}/f{idx}_store.json", "w") as f:
+            json.dump(fs, f, indent=2)
+
+    print(f"Snapshots saved to: {base}/")
+
+
+# -----------------------------------------
+# Plotting
+# -----------------------------------------
 def plot_latency_stats(quorums, all_latencies):
-    """
-    quorums: list of quorum values tested, e.g. [1,2,3,4,5]
-    all_latencies: list of lists of latencies per quorum
-    """
-
     means, medians, p95s, p99s = [], [], [], []
 
     for lats in all_latencies:
@@ -121,28 +134,25 @@ def plot_latency_stats(quorums, all_latencies):
         p99s.append(np.percentile(arr, 99))
 
     plt.figure(figsize=(10, 6))
-
     plt.plot(quorums, means, marker='o', label="mean")
     plt.plot(quorums, medians, marker='o', label="median")
     plt.plot(quorums, p95s, marker='o', label="p95")
     plt.plot(quorums, p99s, marker='o', label="p99")
 
-    plt.title("Quorum vs Latency (mean, median, p95, p99)\nRandom delay in range [0ms, 1000ms]")
+    plt.title("Quorum vs Latency (mean, median, p95, p99)\nDelay = [0–1000ms]")
     plt.xlabel("Quorum value")
     plt.ylabel("Latency (s)")
     plt.grid(True, alpha=0.3)
-
     plt.xticks(quorums, [f"Q={q}" for q in quorums])
-
     plt.legend()
     plt.tight_layout()
     plt.savefig("quorum_vs_latency_full.png")
     plt.show()
-    print("Saved plot as quorum_vs_latency_full.png")
 
 
-# ---------- Main experiment ----------
-
+# -----------------------------------------
+# Main experiment
+# -----------------------------------------
 def main():
     all_latency_lists = []
     consistency_results = {}
@@ -153,37 +163,37 @@ def main():
             wait_for_cluster_ready()
 
             print(f"Running load test for WRITE_QUORUM={q}...")
-            latencies = asyncio.run(run_load(num_writes=100, concurrent=10))
+            latencies = asyncio.run(run_load(100, 10))
             all_latency_lists.append(latencies)
 
             avg_lat = mean(latencies)
-            print(f"WRITE_QUORUM={q}: "
-                  f"avg={avg_lat:.4f}s, "
-                  f"min={min(latencies):.4f}s, "
-                  f"max={max(latencies):.4f}s")
+            print(f"WRITE_QUORUM={q}: avg={avg_lat:.4f}s")
 
-            # Consistency check
+            # Fetch DBs
             leader_store = fetch_store(LEADER)
             follower_stores = [fetch_store(u) for u in FOLLOWERS]
 
+            # Check consistency
             follower_equalities = [
                 (i + 1, fs == leader_store) for i, fs in enumerate(follower_stores)
             ]
             consistency_results[q] = follower_equalities
 
             for i, eq in follower_equalities:
-                print(f"  Follower {i} store == leader: {eq}")
+                print(f"  follower {i} equal to leader: {eq}")
+
+            # NEW: Save snapshot
+            save_snapshot(q, leader_store, follower_stores)
 
         finally:
             docker_compose_down()
 
-    # Plot everything together
+    # Plot summary
     plot_latency_stats(QUORUM_VALUES, all_latency_lists)
 
-    # Print summary for report
     print("\n=== SUMMARY ===")
     for q, lats in zip(QUORUM_VALUES, all_latency_lists):
-        print(f"WRITE_QUORUM={q}: avg latency={mean(lats):.4f}s")
+        print(f"WRITE_QUORUM={q}: avg={mean(lats):.4f}s")
         for follower_idx, eq in consistency_results[q]:
             print(f"  follower {follower_idx} equal to leader: {eq}")
 

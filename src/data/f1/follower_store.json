@@ -1,0 +1,15 @@
+{
+  "key_test_1": "hello_world",
+  "key_test_2": "replication_test_value",
+  "key_test_quorum": "some_value",
+  "k_0": "v_0",
+  "k_2": "v_2",
+  "k_1": "v_1",
+  "k_3": "v_3",
+  "k_4": "v_4",
+  "k_5": "v_5",
+  "k_6": "v_6",
+  "k_7": "v_7",
+  "k_8": "v_8",
+  "k_9": "v_9"
+}

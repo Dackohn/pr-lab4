@@ -1,30 +1,54 @@
-# app.py
 import os
 import random
+import json
 import asyncio
-from typing import Dict
+from typing import Dict, List
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import httpx
 
-# ----- Config from environment -----
-ROLE = os.getenv("ROLE", "leader")  # "leader" or "follower"
-
-FOLLOWERS_RAW = os.getenv("FOLLOWERS", "")
-FOLLOWER_URLS = [u.strip() for u in FOLLOWERS_RAW.split(",") if u.strip()] if ROLE == "leader" else []
-
-WRITE_QUORUM = int(os.getenv("WRITE_QUORUM", "1"))     # 1..5 for 5 followers
+# -------------------------
+# Environment configuration
+# -------------------------
+ROLE = os.getenv("ROLE", "leader")
+WRITE_QUORUM = int(os.getenv("WRITE_QUORUM", "3"))
 MIN_DELAY_MS = int(os.getenv("MIN_DELAY_MS", "0"))
 MAX_DELAY_MS = int(os.getenv("MAX_DELAY_MS", "1000"))
-
 REPLICATION_TIMEOUT_S = float(os.getenv("REPLICATION_TIMEOUT_S", "2.0"))
 GLOBAL_REQUEST_TIMEOUT_S = float(os.getenv("GLOBAL_REQUEST_TIMEOUT_S", "5.0"))
 
-app = FastAPI(title="KV Store with Single-Leader Replication (Semi-sync)")
+followers_env = os.getenv("FOLLOWERS", "")
+FOLLOWER_URLS: List[str] = [x.strip() for x in followers_env.split(",") if x.strip()] if ROLE == "leader" else []
 
-# Simple in-memory store
+# Shared in-memory KV store
 store: Dict[str, str] = {}
+
+# -------------------------
+# Persistent storage paths
+# -------------------------
+DATA_DIR = "/data"
+NODE_FILE = os.path.join(DATA_DIR, f"{ROLE}_store.json")
+
+def save_store_to_disk():
+    """Persist the current store to /data/<role>_store.json."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(NODE_FILE, "w") as f:
+            json.dump(store, f, indent=2)
+    except Exception as e:
+        print(f"[{ROLE}] Error saving store: {e}")
+
+# -------------------------
+# A single global HTTPX client
+# (not killed when requests handler ends)
+# -------------------------
+CLIENT = httpx.AsyncClient(timeout=REPLICATION_TIMEOUT_S)
+
+# -------------------------
+# API setup
+# -------------------------
+app = FastAPI()
 
 
 class ValuePayload(BaseModel):
@@ -34,10 +58,10 @@ class ValuePayload(BaseModel):
 @app.get("/health")
 async def health():
     return {
+        "ok": True,
         "role": ROLE,
         "write_quorum": WRITE_QUORUM,
         "followers": FOLLOWER_URLS,
-        "ok": True,
     }
 
 
@@ -48,93 +72,107 @@ async def get_key(key: str):
     return {"key": key, "value": store[key]}
 
 
+# ----------------------------------------------------
+# FIXED REPLICATION LOGIC — Full implementation
+# ----------------------------------------------------
 @app.put("/kv/{key}")
 async def put_key(key: str, payload: ValuePayload):
-    """
-    Writes are accepted only by the leader.
-    Semi-synchronous replication: wait for WRITE_QUORUM followers before responding.
-    """
     if ROLE != "leader":
         raise HTTPException(status_code=400, detail="Writes allowed only on leader")
 
-    # 1) Apply locally
+    # 1. Write locally
     store[key] = payload.value
+    save_store_to_disk()
 
-    # 2) If no followers or quorum <= 0, just return
-    if not FOLLOWER_URLS or WRITE_QUORUM <= 0:
+    follower_count = len(FOLLOWER_URLS)
+    quorum = min(WRITE_QUORUM, follower_count)
+
+    # No followers -> nothing to replicate
+    if follower_count == 0 or quorum <= 0:
         return {"status": "ok", "replicated_to": 0}
 
-    # 3) Replicate concurrently with random delays
-    async def replicate_to_follower(follower_url: str) -> bool:
+    async def replicate_to_follower(url: str) -> bool:
         # simulate network lag
         await asyncio.sleep(random.uniform(MIN_DELAY_MS, MAX_DELAY_MS) / 1000.0)
         try:
-            async with httpx.AsyncClient(timeout=REPLICATION_TIMEOUT_S) as client:
-                r = await client.post(
-                    f"{follower_url}/replicate/{key}",
-                    json={"value": payload.value},
-                )
-                r.raise_for_status()
+            r = await CLIENT.post(
+                f"{url}/replicate/{key}",
+                json={"value": payload.value},
+            )
+            r.raise_for_status()
             return True
         except Exception:
             return False
 
+    # Fire off tasks for all followers
     tasks = [asyncio.create_task(replicate_to_follower(u)) for u in FOLLOWER_URLS]
 
-    successes = 0
-    try:
-        # Wait until we either:
-        # - reach the write quorum, or
-        # - all replication tasks finish, or timeout
-        async for finished in _as_completed_with_timeout(tasks, GLOBAL_REQUEST_TIMEOUT_S):
-            ok = await finished
-            if ok:
-                successes += 1
-                if successes >= WRITE_QUORUM:
-                    break
-    except asyncio.TimeoutError:
-        # timed out waiting; just count what we got so far
-        pass
+    # -------------------------
+    # FULL SYNC CASE (quorum == follower_count)
+    # -------------------------
+    if quorum == follower_count:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        successes = sum(1 for r in results if isinstance(r, bool) and r)
 
-    if successes < WRITE_QUORUM:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Replication quorum not reached (successes={successes}, required={WRITE_QUORUM})",
+        if successes < quorum:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Full replication failed (success={successes}, required={quorum})",
+            )
+        return {"status": "ok", "replicated_to": successes}
+
+    # -------------------------
+    # SEMI-SYNC CASE (quorum < follower_count)
+    # -------------------------
+    successes = 0
+    pending = set(tasks)
+    start_time = asyncio.get_event_loop().time()
+
+    while pending and successes < quorum:
+        time_left = GLOBAL_REQUEST_TIMEOUT_S - (asyncio.get_event_loop().time() - start_time)
+        if time_left <= 0:
+            break
+
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=time_left,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
+        if not done:
+            break
+
+        for t in done:
+            try:
+                ok = await t
+            except Exception:
+                ok = False
+
+            if ok:
+                successes += 1
+                if successes >= quorum:
+                    break
+
+    if successes < quorum:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Replication quorum not reached (success={successes}, required={quorum})",
+        )
+
+    # background tasks keep running using global CLIENT → improves eventual consistency
     return {"status": "ok", "replicated_to": successes}
 
 
-async def _as_completed_with_timeout(tasks, timeout: float):
-    """
-    Helper: like asyncio.as_completed but with global timeout.
-    """
-    done_iter = asyncio.as_completed(tasks, timeout=timeout)
-    async for t in _aiter(done_iter):
-        yield t
-
-
-async def _aiter(iterable):
-    for item in iterable:
-        yield item
-
-
+# ----------------------------------------------------
+# FOLLOWER ENDPOINT
+# ----------------------------------------------------
 @app.post("/replicate/{key}")
-async def replicate(key: str, payload: ValuePayload):
-    """
-    Replication endpoint on followers: leader calls this.
-    Followers simply apply the write.
-    """
-    if ROLE != "follower":
-        raise HTTPException(status_code=400, detail="Only followers accept /replicate")
+async def replicate_key(key: str, payload: ValuePayload):
     store[key] = payload.value
+    save_store_to_disk()
     return {"status": "ok"}
 
 
 @app.get("/debug/store")
 async def debug_store():
-    """
-    For testing / experiment: inspect the whole store.
-    DO NOT expose this in a real system.
-    """
     return {"role": ROLE, "store": store}
